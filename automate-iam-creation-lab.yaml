@@ -1,3 +1,219 @@
-template-file-path: automate-iam-creation-lab-deploy.yaml
-parameters: {}
-tags: {}
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lab Template for IAM Users, Groups, and EventBridge Rule
+
+Parameters:
+  EC2UserEmail:
+    Type: String
+    Description: Email address for ec2-user
+  S3UserEmail:
+    Type: String
+    Description: Email address for s3-user
+
+Resources:
+  # Generate a one-time password and store it in Secrets Manager
+  OneTimePasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: OneTimePassword
+      Description: Temporary password for IAM users
+      GenerateSecretString:
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+
+  # Create S3 User Group with read access to S3
+  S3UserGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: S3UserGroup
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                Resource: '*'
+
+  # Create EC2 User Group with read access to EC2
+  EC2UserGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: EC2UserGroup
+      Policies:
+        - PolicyName: EC2ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                Resource: '*'
+
+  # Create IAM Users
+  EC2User:
+    Type: AWS::IAM::User
+    DependsOn: UserCreationEventRule
+    Properties:
+      UserName: ec2-user
+      Groups:
+        - !Ref EC2UserGroup
+      LoginProfile:
+        Password: !Sub '{{resolve:secretsmanager:OneTimePassword}}'
+        PasswordResetRequired: true
+
+  S3User:
+    Type: AWS::IAM::User
+    DependsOn: UserCreationEventRule
+    Properties:
+      UserName: s3-user
+      Groups:
+        - !Ref S3UserGroup
+      LoginProfile:
+        Password: !Sub '{{resolve:secretsmanager:OneTimePassword}}'
+        PasswordResetRequired: true
+
+  # Store user emails in Parameter Store
+  EC2UserEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /iam/users/ec2-user/email
+      Type: String
+      Value: !Ref EC2UserEmail
+
+  S3UserEmailParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /iam/users/s3-user/email
+      Type: String
+      Value: !Ref S3UserEmail
+
+  # EventBridge Rule to detect new user creation
+  UserCreationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - CreateUser
+            - CreateLoginProfile
+      Targets:
+        - Id: LogUserDetailsLambda
+          Arn: !GetAtt LogUserDetailsLambda.Arn
+
+  # Permission for EventBridge to invoke Lambda
+  UserCreationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogUserDetailsLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UserCreationEventRule.Arn
+
+  # Lambda Function to log user details
+  LogUserDetailsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              try:
+                  ssm = boto3.client('ssm')
+                  secrets = boto3.client('secretsmanager')
+          
+                  # Extract user details safely
+                  detail = event.get('detail', {})
+                  request_parameters = detail.get('requestParameters', {})
+                  user_name = request_parameters.get('userName', 'unknown')
+          
+                  logger.info(f"User creation detected: {user_name}")
+          
+                  # Try to get the email if the parameter exists
+                  try:
+                      email_param = ssm.get_parameter(Name=f'/iam/users/{user_name}/email')
+                      email = email_param['Parameter']['Value']
+                      logger.info(f"Found email for user {user_name}: {email}")
+                  except ssm.exceptions.ParameterNotFound:
+                      logger.warning(f"No email parameter found for user: {user_name}")
+                      email = "Not found in SSM"
+          
+                  # Get the one-time password
+                  try:
+                      password_response = secrets.get_secret_value(SecretId='OneTimePassword')
+                      password = password_response['SecretString']
+                      logger.info(f"Initial password for user {user_name}: {password}")
+                  except Exception as e:
+                      logger.error(f"Error retrieving password: {str(e)}")
+                      password = "Password retrieval failed"
+          
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f"Processed user creation event for: {user_name}")
+                  }
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  logger.error(f"Event: {json.dumps(event)}")
+                  raise
+
+      Runtime: python3.9
+      Timeout: 10
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/iam/users/*'
+                  - !Ref OneTimePasswordSecret
+
+Outputs:
+  OneTimePasswordSecretArn:
+    Description: ARN of the One-Time Password Secret
+    Value: !Ref OneTimePasswordSecret
+  EC2UserEmailParameterName:
+    Description: Name of the EC2 User Email Parameter
+    Value: !Ref EC2UserEmailParameter
+  S3UserEmailParameterName:
+    Description: Name of the S3 User Email Parameter
+    Value: !Ref S3UserEmailParameter
+  LambdaFunctionName:
+    Description: Name of the User Details Logging Lambda Function
+    Value: !Ref LogUserDetailsLambda
+  EventBridgeRuleName:
+    Description: Name of the EventBridge Rule for User Creation
+    Value: !Ref UserCreationEventRule
